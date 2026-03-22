@@ -1,4 +1,0 @@
-Estudios de análisis clínicos desglosado por tipo de estudio, edad, nivel socioeconómico y demográficos.
-
-Categoría: Salud
-Institución: Instituto Nacional de Psiquiatría "Ramón de la Fuente Muñiz" (INPRFM)
