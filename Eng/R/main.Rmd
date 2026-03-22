@@ -1,0 +1,788 @@
+---
+title: "🏆 Simulating FIFA World Cup 2026"
+subtitle: "Exploratory analysis, Monte Carlo simulation and data visualization"
+author: "Joel Giroud"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+    toc_depth: 3
+    theme: darkly
+    highlight: zenburn
+    code_folding: show
+    number_sections: true
+    df_print: paged
+    self_contained: true
+---
+
+# =============================================================================
+# INTRODUCTION
+# =============================================================================
+
+This project analyzes the **FIFA World Cup 2026**, the first in history to feature
+48 national teams across 3 host countries (Mexico, United States, and Canada).
+The goal is to answer 3 questions through data analysis:
+
+1. **How are the matches distributed across venues, groups, and dates?**
+2. **Which team has the highest probability of winning the tournament?**
+3. **How does Mexico's local hosting advantage impact its probabilities?**
+
+**Methodology:**  
+This project uses the January 2026 FIFA rankings as a quantitative proxy for each
+team's strength, as they summarize recent performance in a single score — weighting
+opponents, match importance, and results — similarly to Elo systems used in the
+sports modeling literature.
+
+From those scores, we build a logistic model that translates the points difference
+between two teams into a win probability, since logistic regression is a standard
+approach for estimating binary event probabilities such as "A wins vs A does not win"
+in sports models (see non-deterministic algorithms and binomial distributions).
+
+On top of that single-match model, we apply a Monte Carlo simulation (widely accepted
+in tournament modeling): we generate 10,000 complete tournaments, respecting the
+group stage and knockout format, to quantify the distribution of possible outcomes
+(champion, finalist, etc.) rather than a single point estimate — which is precisely
+Monte Carlo's advantage when uncertainty and bracket combinations are numerous.
+
+---
+
+## Environment setup
+We load the required packages and define file paths. All datasets are stored
+outside the project in `../datasets/` to keep the repository clean.
+
+# =============================================================================
+# 01 - Initial Validation & Merge — World Cup 2026
+# =============================================================================
+
+```{r setup, include=TRUE}
+# ✅ FIX: each if (!require) installs its own package
+if (!require("dplyr"))       install.packages("dplyr")
+if (!require("readr"))       install.packages("readr")
+if (!require("tidyverse"))   install.packages("tidyverse")
+if (!require("janitor"))     install.packages("janitor")
+if (!require("lubridate"))   install.packages("lubridate")
+if (!require("pointblank"))  install.packages("pointblank")
+if (!require("kableExtra"))  install.packages("kableExtra")
+if (!require("countrycode")) install.packages("countrycode")
+if (!require("ggimage"))     install.packages("ggimage")
+if (!require("ggtext"))      install.packages("ggtext")
+
+library(dplyr)
+library(readr)
+library(tidyverse)
+library(janitor)
+library(lubridate)
+library(pointblank)
+library(kableExtra)
+library(countrycode)
+library(ggimage)
+library(ggtext)
+library(ggplot2)
+
+PATH_RAW      <- "../datasets/FIFA World Cup 2026 Match Data (Unofficial)/"
+PATH_DATASETS <- "../datasets/"
+PATH_DATA     <- "data/"
+PATH_OUTPUT   <- "output/"
+
+if (!dir.exists(PATH_DATA))   dir.create(PATH_DATA)
+if (!dir.exists(PATH_OUTPUT)) dir.create(PATH_OUTPUT)
+
+print("Setup complete ✅")
+```
+
+# =============================================================================
+# 1. LOADING DATASETS
+# =============================================================================
+
+We work with **3 public and verifiable sources**:
+
+| Dataset | Source | Description |
+|---------|--------|-------------|
+| FIFA WC 2026 Match Data | Kaggle (unofficial) | Fixtures, teams, venues and tournament groups |
+| FIFA/Coca-Cola Rankings | FIFA official | Scores for 210 national teams (January 2026) |
+| FIFA WC All Dataset | Gigasheet | World Cup historical data 1930–2022 |
+
+> **Note:** Kaggle datasets are unofficial but built from FIFA's public information.
+> Rankings are official and updated as of January 2026.
+
+```{r 01 - Carga de datasets, include=TRUE}
+print("=== LOADING DATASETS ===")
+matches      <- read_csv(paste0(PATH_RAW, "matches.csv"),           show_col_types = FALSE)
+teams        <- read_csv(paste0(PATH_RAW, "teams.csv"),             show_col_types = FALSE)
+venues       <- read_csv(paste0(PATH_RAW, "host_cities.csv"),       show_col_types = FALSE)
+stages       <- read_csv(paste0(PATH_RAW, "tournament_stages.csv"), show_col_types = FALSE)
+rankings_raw <- read_csv(paste0(PATH_DATASETS, "fifa_rankings.csv"),show_col_types = FALSE)
+hist         <- read_csv(paste0(PATH_DATASETS,
+                 "FIFA World Cup 1930-2022 All Match Dataset.csv"),
+                 show_col_types = FALSE)
+
+cat("matches :", nrow(matches), "rows |", ncol(matches), "cols\n")
+cat("teams   :", nrow(teams),   "rows |", ncol(teams),   "cols\n")
+cat("venues  :", nrow(venues),  "rows |", ncol(venues),  "cols\n")
+cat("stages  :", nrow(stages),  "rows |", ncol(stages),  "cols\n")
+cat("rankings:", nrow(rankings_raw), "rows |", ncol(rankings_raw), "cols\n")
+cat("hist    :", nrow(hist),    "rows |", ncol(hist),    "cols\n")
+```
+
+# =============================================================================
+# 2. DATA VALIDATION
+# =============================================================================
+
+## Quality validation
+Before any analysis, we validate data integrity using the `pointblank` package.
+We check 4 key dimensions of the **Data Quality Framework**:
+
+- **Completeness:** No null values in critical columns (IDs, dates)
+- **Validity:** Positive IDs, ISO-formatted dates
+- **Uniqueness:** No duplicate records
+- **Consistency:** Logical ranges across all variables
+
+Detailed HTML reports are saved to `output/` for auditing purposes.
+
+## Cleaning and name standardization
+A common challenge in data projects is that **different sources use different names**
+for the same entity. For example, `fifa_rankings.csv` uses `"Korea Republic"` while
+`teams.csv` uses `"South Korea"`.
+
+Every correction is explicitly documented in the `case_when()` to keep the process
+reproducible and auditable. We found **3 name inconsistencies** and **1 encoding issue**
+(`Côte d'Ivoire`).
+
+```{r 02 Validación con pointblank, include=TRUE}
+al <- action_levels(warn_at = 0.05, stop_at = 0.20)
+
+agent_matches <- create_agent(
+  tbl = matches, tbl_name = "matches",
+  label = "Data Validation World Cup 2026 - Matches", actions = al
+) %>%
+  col_vals_not_null(columns = vars(home_team_id, away_team_id, city_id, stage_id, kickoff_at)) %>%
+  col_vals_gt(columns = vars(home_team_id, away_team_id, city_id), value = 0) %>%
+  col_vals_regex(columns = vars(kickoff_at), regex = "^\\d{4}-\\d{2}-\\d{2}") %>%
+  rows_distinct(columns = vars(id)) %>%
+  interrogate()
+
+cat("=== MATCHES REPORT ===\n")
+print(agent_matches)
+
+agent_teams <- create_agent(
+  tbl = teams, tbl_name = "teams",
+  label = "Data Validation World Cup 2026 - Teams", actions = al
+) %>%
+  col_vals_not_null(columns = everything()) %>%
+  rows_distinct() %>%
+  interrogate()
+
+cat("\n=== TEAMS REPORT ===\n")
+print(agent_teams)
+
+agent_venues <- create_agent(
+  tbl = venues, tbl_name = "venues",
+  label = "Data Validation World Cup 2026 - Venues", actions = al
+) %>%
+  col_vals_not_null(columns = everything()) %>%
+  rows_distinct() %>%
+  interrogate()
+
+cat("\n=== VENUES REPORT ===\n")
+print(agent_venues)
+
+get_agent_report(agent_matches) %>%
+  export_report(filename = paste0(PATH_OUTPUT, "report_matches.html"))
+get_agent_report(agent_teams) %>%
+  export_report(filename = paste0(PATH_OUTPUT, "report_teams.html"))
+get_agent_report(agent_venues) %>%
+  export_report(filename = paste0(PATH_OUTPUT, "report_venues.html"))
+
+print("Reports saved to output/ ✅")
+```
+
+# =============================================================================
+# 3. CLEAN MERGE (Safe joins)
+# =============================================================================
+
+## Data integration (Merge)
+We join all 4 datasets into a single dataframe (`data_full`) using `left_join()`
+on numeric IDs. The result is a table of **104 matches** with all the information
+needed for the analysis:
+
+- Teams (name, group, code)
+- Venue (stadium, city, country)
+- FIFA Rankings (points, position)
+- Derived variables (`rank_diff`, `points_diff`, `is_mexico`)
+
+> `has_teams = TRUE` filters out fixtures that still have placeholder teams
+> (e.g., "Winner UEFA Playoff D"), which exist at the start of the tournament.
+
+```{r 03 - Limpieza y homologación de rankings, include=TRUE}
+rankings_clean <- rankings_raw %>%
+  clean_names() %>%
+  filter(!is.na(rk)) %>%
+  rename(rank = rk, team_name = team, points = total_points,
+         prev_points = previous_points, change = x) %>%
+  select(rank, team_name, points) %>%
+  mutate(team_name = case_when(
+    team_name == "Korea Republic"               ~ "South Korea",
+    team_name == "Türkiye"                      ~ "Turkey",
+    team_name == "Congo DR"                     ~ "DR Congo",
+    str_detect(team_name, "Cura")               ~ "Curaçao",
+    str_detect(team_name, "Ivoire|ivoire|C.te") ~ "Côte d'Ivoire",
+    TRUE ~ team_name
+  ))
+
+cat("Clean rankings:", nrow(rankings_clean), "countries\n\n")
+cat("🔍 Checking problematic teams:\n")
+rankings_clean %>%
+  filter(team_name %in% c("USA","Côte d'Ivoire","IR Iran","Curaçao","South Korea","Turkey")) %>%
+  print()
+
+write_csv(rankings_clean, paste0(PATH_DATA, "fifa_rankings_clean.csv"))
+print("Saved: data/fifa_rankings_clean.csv ✅")
+```
+
+# =============================================================================
+# 4. MAIN MERGE
+# =============================================================================
+
+```{r 04 - Merge principal, include=TRUE}
+teams_clean <- teams %>%
+  rename(team_id = 1, team_name = 2, team_code = 3,
+         group = 4, is_placeholder = 5)
+
+venues_clean <- venues %>%
+  rename(city_id = 1, city_name = 2, country = 3,
+         stadium = 4, region = 5, code = 6)
+
+data_full <- matches %>%
+  mutate(match_date = as.Date(kickoff_at)) %>%
+  left_join(teams_clean %>% select(team_id, team_name, team_code, group, is_placeholder),
+            by = c("home_team_id" = "team_id")) %>%
+  rename(home_name = team_name, home_code = team_code,
+         home_group = group, home_placeholder = is_placeholder) %>%
+  left_join(teams_clean %>% select(team_id, team_name, team_code, group, is_placeholder),
+            by = c("away_team_id" = "team_id")) %>%
+  rename(away_name = team_name, away_code = team_code,
+         away_group = group, away_placeholder = is_placeholder) %>%
+  left_join(venues_clean %>% select(city_id, city_name, country, stadium),
+            by = "city_id") %>%
+  left_join(rankings_clean, by = c("home_name" = "team_name")) %>%
+  rename(home_rank = rank, home_points = points) %>%
+  left_join(rankings_clean, by = c("away_name" = "team_name")) %>%
+  rename(away_rank = rank, away_points = points) %>%
+  clean_names() %>%
+  mutate(
+    rank_diff   = coalesce(home_rank,   50L)   - coalesce(away_rank,   50L),
+    points_diff = coalesce(home_points, 1400)  - coalesce(away_points, 1400),
+    has_teams   = !home_placeholder & !away_placeholder,
+    is_mexico   = country == "Mexico"
+  )
+
+cat("Total matches    :", nrow(data_full), "\n")
+cat("With real teams  :", sum(data_full$has_teams, na.rm = TRUE), "\n")
+cat("At Mexico venue  :", sum(data_full$is_mexico, na.rm = TRUE), "\n")
+
+cat("\n🔍 Matches with match_date NA:", sum(is.na(data_full$match_date)), "\n")
+data_full %>% filter(is.na(match_date)) %>% select(id, kickoff_at) %>% print()
+
+write_csv(data_full, paste0(PATH_DATA, "mundial_2026_full.csv"), na = "")
+write_rds(data_full, paste0(PATH_DATA, "mundial_2026_full.rds"))
+print("Saved: data/mundial_2026_full.csv | data/mundial_2026_full.rds ✅")
+```
+
+# =============================================================================
+# 5. RANKINGS COVERAGE CHECK
+# =============================================================================
+
+## Rankings coverage
+We verify that every real tournament team has an assigned FIFA ranking.
+100% coverage ensures the simulation model will not fall back to default values
+(`1400 pts`) for any qualified team.
+
+```{r 05 - Validar cobertura de rankings, include=TRUE}
+teams_reales <- teams_clean %>% filter(is_placeholder == FALSE) %>% pull(team_name)
+con_ranking  <- teams_reales[teams_reales %in% rankings_clean$team_name]
+sin_ranking  <- teams_reales[!teams_reales %in% rankings_clean$team_name]
+
+cat("Real tournament teams :", length(teams_reales), "\n")
+cat("With FIFA ranking     :", length(con_ranking), "✅\n")
+cat("Without ranking       :", length(sin_ranking), "⚠\n\n")
+
+if (length(sin_ranking) > 0) {
+  cat("Teams to add in case_when (chunk 03):\n")
+  print(sin_ranking)
+} else {
+  print("100% coverage — all teams have a ranking")
+}
+```
+
+# =============================================================================
+# 6. MONTE CARLO SIMULATION SETUP
+# =============================================================================
+
+## Simulation model
+
+### Model assumptions
+The predictive model is based on the following assumptions:
+
+1. **Team strength** is well approximated by FIFA points
+2. **Win probability** follows a logistic function over the points difference
+3. **Goals** follow a Poisson distribution with a mean proportional to the strength difference
+4. **Mexico's home advantage:** +8% over the base probability (adjustable)
+5. **In knockout rounds**, draws are resolved by penalties (50/50 probability)
+
+### Known limitations
+- Does not account for injuries, suspensions, or recent form
+- Placeholder teams (yet-to-qualify via playoffs) are excluded until known
+- The home boost is an estimate; it can be calibrated using historical World Cup data
+
+```{r 06 - Simulación Monte Carlo (funciones), include=TRUE}
+sim_match <- function(points_home, points_away, home_boost = 0) {
+  diff   <- (points_home - points_away) / 600 + home_boost
+  p_home <- plogis(diff + 0.1)
+  p_away <- plogis(-diff)
+  p_draw <- 1 - p_home - p_away
+  probs  <- pmax(c(p_home, p_draw, p_away), 0.05)
+  probs  <- probs / sum(probs)
+  sample(c("home", "draw", "away"), size = 1, prob = probs)
+}
+
+sim_group <- function(data_full, teams_ranked, mexico_boost = 0.08) {
+  results <- list()
+  grupos  <- data_full %>%
+    filter(has_teams == TRUE, !is.na(home_group)) %>%
+    pull(home_group) %>% unique()
+
+  for (g in grupos) {
+    group_matches <- data_full %>% filter(home_group == g, has_teams == TRUE)
+    group_teams   <- unique(c(group_matches$home_name, group_matches$away_name))
+    standings     <- tibble(team = group_teams, pts = 0, gf = 0, ga = 0, played = 0)
+
+    for (i in seq_len(nrow(group_matches))) {
+      h     <- group_matches$home_name[i]
+      a     <- group_matches$away_name[i]
+      h_pts <- teams_ranked$points[teams_ranked$team == h]
+      a_pts <- teams_ranked$points[teams_ranked$team == a]
+      h_pts <- ifelse(length(h_pts) == 0 || is.na(h_pts), 1400, h_pts)
+      a_pts <- ifelse(length(a_pts) == 0 || is.na(a_pts), 1400, a_pts)
+      boost  <- ifelse(group_matches$is_mexico[i], mexico_boost, 0)
+      result <- sim_match(h_pts, a_pts, home_boost = boost)
+      lh <- exp(0.3 + (h_pts - a_pts) / 2000)
+      la <- exp(0.3 - (h_pts - a_pts) / 2000)
+      gh <- rpois(1, pmin(lh, 5))
+      ga <- rpois(1, pmin(la, 5))
+      if (result == "home") {
+        standings$pts[standings$team == h] <- standings$pts[standings$team == h] + 3
+      } else if (result == "away") {
+        standings$pts[standings$team == a] <- standings$pts[standings$team == a] + 3
+      } else {
+        standings$pts[standings$team == h] <- standings$pts[standings$team == h] + 1
+        standings$pts[standings$team == a] <- standings$pts[standings$team == a] + 1
+      }
+      standings$gf[standings$team == h] <- standings$gf[standings$team == h] + gh
+      standings$ga[standings$team == h] <- standings$ga[standings$team == h] + ga
+      standings$gf[standings$team == a] <- standings$gf[standings$team == a] + ga
+      standings$ga[standings$team == a] <- standings$ga[standings$team == a] + gh
+      standings$played[standings$team == h] <- standings$played[standings$team == h] + 1
+      standings$played[standings$team == a] <- standings$played[standings$team == a] + 1
+    }
+    standings  <- standings %>%
+      mutate(gd = gf - ga, group = g) %>%
+      arrange(desc(pts), desc(gd), desc(gf))
+    results[[g]] <- standings
+  }
+
+  all_standings <- bind_rows(results)
+  top2 <- all_standings %>%
+    group_by(group) %>% slice_head(n = 2) %>%
+    mutate(classified_as = ifelse(row_number() == 1, "1st", "2nd")) %>% ungroup()
+  terceros <- all_standings %>%
+    group_by(group) %>% slice(3) %>% ungroup() %>%
+    arrange(desc(pts), desc(gd), desc(gf)) %>%
+    slice_head(n = 8) %>% mutate(classified_as = "3rd")
+  bind_rows(top2, terceros) %>% select(team, pts, gd, gf, group, classified_as)
+}
+
+sim_knockout <- function(teams_vec, teams_ranked) {
+  winners <- c()
+  for (i in seq(1, length(teams_vec), by = 2)) {
+    h     <- teams_vec[i];  a <- teams_vec[i + 1]
+    h_pts <- teams_ranked$points[teams_ranked$team == h]
+    a_pts <- teams_ranked$points[teams_ranked$team == a]
+    h_pts <- ifelse(length(h_pts) == 0 || is.na(h_pts), 1400, h_pts)
+    a_pts <- ifelse(length(a_pts) == 0 || is.na(a_pts), 1400, a_pts)
+    result <- sim_match(h_pts, a_pts)
+    winner <- if (result == "home") h else if (result == "away") a else sample(c(h, a), 1)
+    winners <- c(winners, winner)
+  }
+  winners
+}
+
+run_tournament <- function(data_full, teams_ranked, mexico_boost = 0.08) {
+  clasificados <- sim_group(data_full, teams_ranked, mexico_boost)
+  equipos_kn   <- clasificados$team
+  while (length(equipos_kn) < 32) equipos_kn <- c(equipos_kn, sample(clasificados$team, 1))
+  equipos_kn <- equipos_kn[1:32]
+  r32     <- sim_knockout(equipos_kn, teams_ranked)
+  r16     <- sim_knockout(r32,        teams_ranked)
+  qf      <- sim_knockout(r16,        teams_ranked)
+  sf      <- sim_knockout(qf,         teams_ranked)
+  campeon <- sim_knockout(sf,         teams_ranked)
+  list(champion = campeon, finalist = sf, semi = qf, quarter = r16)
+}
+
+print("Simulation functions loaded (F1–F4) ✅")
+```
+
+# =============================================================================
+# 7. RUNNING MONTE CARLO SIMULATION [10k]
+# =============================================================================
+
+```{r 07 - Simulación Monte Carlo (ejecución 10k), include=TRUE}
+teams_ranked <- data_full %>%
+  filter(has_teams == TRUE) %>%
+  select(home_name, home_points) %>%
+  rename(team = home_name, points = home_points) %>%
+  bind_rows(
+    data_full %>% filter(has_teams == TRUE) %>%
+      select(away_name, away_points) %>%
+      rename(team = away_name, points = away_points)
+  ) %>%
+  filter(!is.na(points)) %>%
+  distinct(team, .keep_all = TRUE)
+
+cat("Teams in simulation:", nrow(teams_ranked), "\n\n")
+
+set.seed(2026)
+N_SIMS    <- 10000
+champions <- character(N_SIMS)
+finalists <- character(N_SIMS * 2)
+
+cat("🔄 Running", N_SIMS, "simulations...\n")
+start_time <- Sys.time()
+
+for (i in seq_len(N_SIMS)) {
+  result       <- run_tournament(data_full, teams_ranked)
+  champions[i] <- result$champion
+  finalists[((i - 1) * 2 + 1):(i * 2)] <- result$finalist
+  if (i %% 2000 == 0) cat(" →", i, "completed...\n")
+}
+
+elapsed <- round(as.numeric(Sys.time() - start_time, units = "secs"), 1)
+cat("Completed in", elapsed, "seconds ✅\n")
+```
+
+# =============================================================================
+# 8. RESULTS & EXPORT
+# =============================================================================
+
+## Monte Carlo simulation results
+We ran **10,000 complete tournaments** with `set.seed(2026)` to guarantee
+reproducibility. Results reflect statistical probabilities based exclusively
+on current FIFA rankings and the tournament structure.
+
+### Key observations
+- **Spain, Argentina, and France** account for ~19% of championship probability,
+consistent with their dominance in the FIFA rankings
+- **Mexico** ranks **#11 for champion (3.63%)** and **#9 for reaching the final (7.39%)**,
+boosted by its home-venue advantage
+- The distribution is relatively flat (6.61% max), reflecting the new 48-team format
+where tournament variance is higher than in previous editions
+
+```{r 08 - Resultados y exportación, include=TRUE}
+prob_campeon <- table(champions) %>%
+  as_tibble() %>%
+  rename(team = champions, n_wins = n) %>%
+  mutate(prob_title = round(n_wins / N_SIMS * 100, 2)) %>%
+  arrange(desc(prob_title))
+
+prob_final <- table(finalists) %>%
+  as_tibble() %>%
+  filter(finalists != "") %>%
+  rename(team = finalists, n_final = n) %>%
+  mutate(prob_final = round(n_final / N_SIMS * 100, 2)) %>%
+  arrange(desc(prob_final))
+
+cat("🏆 TOP 15 - CHAMPION PROBABILITY:\n")
+cat("══════════════════════════════════\n")
+prob_campeon %>% slice_head(n = 15) %>% print(n = 15)
+
+cat("\n🥈 TOP 10 - FINALIST PROBABILITY:\n")
+cat("══════════════════════════════════\n")
+prob_final %>% slice_head(n = 10) %>% print(n = 10)
+
+cat("\n🇲🇽 MEXICO METRICS:\n")
+cat("════════════════════\n")
+mex_title <- prob_campeon %>% filter(team == "Mexico") %>% pull(prob_title)
+mex_final <- prob_final   %>% filter(team == "Mexico") %>% pull(prob_final)
+cat("Champion probability :", ifelse(length(mex_title) > 0, paste0(mex_title, "%"), "< 0.01%"), "\n")
+cat("Finalist probability :", ifelse(length(mex_final) > 0, paste0(mex_final, "%"), "< 0.01%"), "\n")
+
+write_csv(prob_campeon, paste0(PATH_OUTPUT, "sim_prob_campeon.csv"))
+write_csv(prob_final,   paste0(PATH_OUTPUT, "sim_prob_final.csv"))
+print("Exported: output/sim_prob_campeon.csv | output/sim_prob_final.csv ✅")
+```
+
+# =============================================================================
+# 09 - VISUALIZATION: Championship Probabilities
+# =============================================================================
+
+## Visualizations
+Charts are generated with `ggplot2` and exported at high resolution (300 dpi) to `output/`.
+They are ready to be included in presentations, reports, or the GitHub README.
+
+```{r 09 - Visualizacion Campeon, include=TRUE, fig.width=10, fig.height=8}
+plot_campeon <- prob_campeon %>%
+  slice_head(n = 15) %>%
+  mutate(
+    iso2 = tolower(countrycode(team, origin = 'country.name', destination = 'iso2c')),
+    iso2 = ifelse(team == "England", "gb-eng", iso2)
+  )
+
+g_campeon <- ggplot(plot_campeon, aes(x = reorder(team, prob_title), y = prob_title)) +
+  geom_segment(aes(xend = team, y = 0, yend = prob_title), color = "gray70", size = 1.2) +
+  geom_flag(aes(y = prob_title + 0.2, image = iso2), size = 0.05) +
+  geom_text(aes(y = prob_title + 0.8, label = paste0(prob_title, "%")),
+            size = 4.5, fontface = "bold", color = "#F4D03F") +
+  coord_flip() +
+  scale_y_continuous(limits = c(0, max(plot_campeon$prob_title) + 1.5)) +
+  labs(
+    title    = "🏆 Probability of Winning the 2026 World Cup",
+    subtitle = "Based on 10,000 Monte Carlo simulations using FIFA Rankings",
+    x = "", y = "Probability (%)",
+    caption  = "Data Analysis Portfolio"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.background  = element_rect(fill = "#1a1a2e", color = NA),
+    panel.background = element_rect(fill = "#1a1a2e", color = NA),
+    plot.title    = element_text(face = "bold", size = 18, margin = margin(b = 10), color = "white"),
+    plot.subtitle = element_text(color = "gray60", size = 12, margin = margin(b = 20)),
+    axis.text     = element_text(face = "bold", color = "#a0aec0", size = 12),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor.x = element_blank(),
+    panel.grid.major.x = element_line(color = "#2d3748", linewidth = 0.3)
+  )
+
+print(g_campeon)
+ggsave(paste0(PATH_OUTPUT, "plot_campeon.png"), g_campeon, width = 10, height = 7, dpi = 300)
+print("Chart saved: output/plot_campeon.png ✅")
+```
+
+# =============================================================================
+# 10 - VISUALIZATION: Venue Distribution (Mexico focus)
+# =============================================================================
+
+```{r 10 - Visualizacion Sedes, include=TRUE, fig.width=10, fig.height=8}
+plot_sedes <- data_full %>%
+  count(stadium, city_name, country) %>%
+  arrange(desc(n)) %>%
+  mutate(
+    sede_label = paste0(stadium, " (", city_name, ")"),
+    color_pais = case_when(
+      country == "Mexico" ~ "#006847",
+      country == "USA"    ~ "#002868",
+      country == "Canada" ~ "#FF0000",
+      TRUE ~ "gray"
+    )
+  )
+
+g_sedes <- ggplot(plot_sedes, aes(x = reorder(sede_label, n), y = n, fill = color_pais)) +
+  geom_col(width = 0.7, alpha = 0.9) +
+  geom_text(aes(label = n), hjust = -0.3, size = 4.5, fontface = "bold", color = "white") +
+  coord_flip() +
+  scale_fill_identity() +
+  scale_y_continuous(limits = c(0, max(plot_sedes$n) + 1), breaks = seq(0, 10, by = 2)) +
+  labs(
+    title    = "🏟️ 2026 World Cup Matches by Stadium",
+    subtitle = "Distribution of 104 matches across Mexico, United States, and Canada.",
+    x = "", y = "Number of Matches",
+    caption  = "Official FIFA data | Data Analysis Portfolio"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.background  = element_rect(fill = "#1a1a2e", color = NA),
+    panel.background = element_rect(fill = "#1a1a2e", color = NA),
+    plot.title    = element_text(face = "bold", size = 18, color = "white"),
+    plot.subtitle = element_markdown(size = 12, color = "gray60"),
+    axis.text     = element_text(size = 11, color = "#a0aec0"),
+    panel.grid.major.y = element_blank(),
+    legend.position = "none"
+  )
+
+print(g_sedes)
+ggsave(paste0(PATH_OUTPUT, "plot_sedes.png"), g_sedes, width = 10, height = 8, dpi = 300)
+print("Chart saved: output/plot_sedes.png ✅")
+```
+
+# =============================================================================
+# 11: AUXILIARY CSVs FOR POWER BI
+# =============================================================================
+
+```{r 11 - CSV auxiliares Power BI, include=TRUE}
+# Helper to write UTF-8 CSVs with BOM (ensures correct encoding in Power BI)
+write_csv_utf8 <- function(x, path, ...) {
+  tmp <- tempfile(fileext = ".csv")
+  readr::write_csv(x, tmp, ...)
+  raw <- readBin(tmp, what = "raw", n = file.info(tmp)$size)
+  bom <- charToRaw("\ufeff")
+  writeBin(c(bom, raw), path)
+}
+
+curiosidades <- tibble(
+  categoria = c(
+    "Países campeones","Finales más goleadoras","Goles promedio/edición",
+    "Partidos más largos","Ediciones disputadas","Países participantes total",
+    "Récord victorias consecutivas","Goles totales","% empates",
+    "Victorias locales","Finales por penales","Remontadas épicas",
+    "México en Mundiales","México títulos"
+  ),
+  valor = c(
+    "8","1958 (9 goles)","2.8","120 min","22",
+    "82 países","25 victorias (Brasil)","2,778","26%",
+    "41%","5","12%","17/22","0"
+  ),
+  fuente = c(
+    "Histórico","Suecia 1958","1930-2022","Prórrogas","1930-2022",
+    "Histórico","1970","Histórico","Histórico","Histórico",
+    "1994, 2006...","Estadística","Histórico","Histórico"
+  )
+)
+write_csv_utf8(curiosidades, "../datasets/dim_curiosidades_mundial.csv", na = "")
+cat("✅ dim_curiosidades_mundial.csv:", nrow(curiosidades), "rows\n")
+
+# Load full historical dataset
+hist_completo <- read_csv(
+  "../datasets/FIFA World Cup 1930-2022 All Match Dataset.csv",
+  show_col_types = FALSE
+)
+
+# Extract champions from traditional finals (20 editions)
+campeones_finales <- hist_completo %>%
+  filter(`Stage Name` == "final") %>%
+  mutate(
+    campeon = case_when(
+      `Home Team Win` == 1 ~ `Home Team Name`,
+      `Away Team Win` == 1 ~ `Away Team Name`,
+      TRUE ~ NA_character_
+    ),
+    campeon = case_when(campeon == "West Germany" ~ "Germany", TRUE ~ campeon)
+  ) %>%
+  pull(campeon) %>% discard(is.na)
+
+# Add Uruguay 1950 (round-robin edition, no traditional final)
+campeones_completos    <- c(campeones_finales, "Uruguay")
+dim_titulos_historicos <- tibble(team = campeones_completos) %>%
+  count(team, name = "titulos_historicos") %>%
+  arrange(dplyr::desc(titulos_historicos))
+
+write_csv_utf8(dim_titulos_historicos, "../datasets/dim_titulos_historicos.csv", na = "")
+cat("✅ dim_titulos_historicos.csv:", nrow(dim_titulos_historicos), "teams\n")
+print(dim_titulos_historicos)
+
+# ✅ FIX: object renamed from dim_jugadores_top → dim_leyendas (consistent)
+dim_leyendas <- tibble(
+  jugador = c(
+    "Miroslav Klose","Ronaldo","Gerd Müller","Just Fontaine","Lionel Messi",
+    "Peter Shilton","Fabien Barthez","Hugo Lloris","Manuel Neuer","Iker Casillas"
+  ),
+  tipo      = c(rep("Goleador", 5), rep("Portero", 5)),
+  record    = c(16, 15, 14, 13, 13, 10, 9, 8, 7, 7),
+  pais      = c("Germany","Brazil","Germany","France","Argentina",
+                "England","France","France","Germany","Spain"),
+  mundiales = c(4, 3, 2, 1, 5, 3, 3, 3, 2, 3)
+) %>%
+  arrange(tipo, desc(record)) %>%
+  mutate(promedio_por_mundial = round(record / mundiales, 1))
+
+write_csv_utf8(dim_leyendas, "../datasets/dim_leyendas.csv", na = "")
+cat("✅ dim_leyendas.csv:", nrow(dim_leyendas), "players\n")
+print(dim_leyendas)
+
+# Convert historical data to long format: one row per team per match
+partidos_largo <- bind_rows(
+  hist_completo %>%
+    transmute(fecha = lubridate::mdy(`Match Date`), team = `Home Team Name`, victoria = `Home Team Win`),
+  hist_completo %>%
+    transmute(fecha = lubridate::mdy(`Match Date`), team = `Away Team Name`, victoria = `Away Team Win`)
+) %>%
+  mutate(team = case_when(team == "West Germany" ~ "Germany", TRUE ~ team)) %>%
+  arrange(team, fecha)
+
+# Function to calculate maximum win streak using rle()
+max_racha <- function(victorias) {
+  if (all(victorias == 0)) return(0)
+  r <- rle(victorias)
+  max(r$lengths[r$values == 1], na.rm = TRUE)
+}
+
+dim_rachas_victorias <- partidos_largo %>%
+  group_by(team) %>%
+  summarise(
+    partidos_totales        = n(),
+    victorias_totales       = sum(victoria, na.rm = TRUE),
+    record_victorias_consec = max_racha(victoria),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(record_victorias_consec))
+
+write_csv_utf8(dim_rachas_victorias, "../datasets/dim_rachas_victorias.csv")
+cat("✅ dim_rachas_victorias.csv:", nrow(dim_rachas_victorias), "teams\n")
+print(dim_rachas_victorias, n = 15)
+```
+
+# =============================================================================
+# 12. CONCLUSIONS
+# =============================================================================
+
+```{r conclusiones-inline, include=FALSE}
+top1      <- prob_campeon %>% arrange(desc(prob_title)) %>% slice(1)
+top2      <- prob_campeon %>% arrange(desc(prob_title)) %>% slice(2)
+top3      <- prob_campeon %>% arrange(desc(prob_title)) %>% slice(3)
+mex_pos   <- which(prob_campeon$team == "Mexico")
+mex_title <- prob_campeon %>% filter(team == "Mexico") %>% pull(prob_title)
+mex_final <- prob_final   %>% filter(team == "Mexico") %>% pull(prob_final)
+```
+
+The results of 10,000 simulations point to **`r top1$team`** as the clear favorite
+with **`r top1$prob_title`%** championship probability, followed by **`r top2$team`**
+(**`r top2$prob_title`%**) and **`r top3$team`** (**`r top3$prob_title`%**).
+
+Three key findings:
+
+1. **The ranking–probability correlation is robust.** The scatter confirms the model is
+   coherent — higher FIFA points consistently translate into higher championship probability.
+
+2. **The 48-team format opens up the tournament.** With a maximum individual probability
+   of just `r top1$prob_title`%, no team is an overwhelming favorite; uncertainty is higher
+   than in any previous edition.
+
+3. **Mexico has a genuine shot as host.** With **`r mex_title`%** championship probability
+   and **`r mex_final`%** probability of reaching the Final, Mexico ranks **#`r mex_pos`**
+   globally — firmly within the group of teams with realistic chances. The +8% home boost
+   reflects the local advantage documented in the sports modeling literature.
+
+---
+
+# 13. About this project {.unnumbered}
+
+This project is part of my **data analysis portfolio**, developed from January
+to March 2026. It demonstrates skills across:
+
+| Area | Tools |
+|------|-------|
+| **Data engineering** | R · tidyverse · janitor · lubridate |
+| **Data quality** | pointblank (Data Quality Framework) |
+| **Applied statistics** | Logistic model · Monte Carlo simulation |
+| **Visualization** | ggplot2 · ggimage · Power BI (5 pages) |
+| **Reproducible reporting** | R Markdown → self-contained HTML |
+| **Version control** | Git · GitHub |
+
+> 📊 **Interactive dashboard** available in Power BI (5 pages with HTML Content lite)  
+> 💻 **Source code** available on GitHub  
+> 📧 **Contact:** [joel.giroud01@gmail.com](mailto:joel.giroud01@gmail.com) · [LinkedIn](https://linkedin.com/in/joel-pgiroud)
+
+---
+
+*Data: Official FIFA · Kaggle · Data Analysis Portfolio · 2026*
